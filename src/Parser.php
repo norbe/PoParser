@@ -33,6 +33,14 @@ class Parser
      * @var array
      */
     protected $currentEntry;
+    /**
+     * @var array
+     */
+    protected $currentLine;
+    /**
+     * @var int
+     */
+    protected $pluralIndex;
 
     /**
      * @var boolean
@@ -116,7 +124,6 @@ class Parser
         $this->justNewEntry = false;
 
         $data = $this->parseLine($line);
-
         if ($data['key'][0] === '#') {
             $this->handleComment($data);
             return;
@@ -149,6 +156,16 @@ class Parser
      */
     protected function parseLine($line)
     {
+		if(strpos($line, '#~') === 0) {
+			$line = substr($line, strpos($line, '#~|') === 0 ? 4 : 3);
+			$this->currentEntry['obsolete'] = TRUE;
+		}
+		if($this->currentLine && isset($line{0}) && $line{0} == '"') {
+			return array(
+				'key' => $this->currentLine['key'],
+				'value' => $line,
+			);
+		} 
         $split = preg_split('/\s/', $line, 2);
 
         return array(
@@ -195,9 +212,6 @@ class Parser
                 // ignore #@ default
                 $this->currentEntry['@'] = $data['value'];
                 break;
-            case '#~':
-                $this->processObsoleteEntry($data['value']);
-                break;
             default:
                 break;
         }
@@ -217,13 +231,15 @@ class Parser
             case 'msgid_plural':
             case 'msgstr':
                 $this->state = $data['key'];
+				$this->pluralIndex = 0;
                 $this->addEntryData($data['value']);
                 break;
             default:
                 if (strpos($data['key'], 'msgstr[') !== false) {
+					$this->pluralIndex = (int)substr($data['key'], 7);
                     // translated plurals
                     $this->state = 'msgstr';
-                    $this->addEntryData($data['value']);
+                    $this->addEntryData($data['value'], $this->pluralIndex);
                 } else {
                     $this->processContinuedLineInSameState($rawLine);
                 }
@@ -249,43 +265,21 @@ class Parser
                 $this->currentEntry[$this->state][] = $line;
                 break;
             case 'msgstr':
-                $this->currentEntry['msgstr'][] = trim($line, '"');
+                $this->currentEntry['msgstr'][$this->pluralIndex][] = trim($line, '"');
                 break;
-            default:
-                throw new \Exception('Parse error!');
+            default: 
+               throw new \Exception('Parse error!');
         }
     }
 
-    /**
-     * @param $data
-     */
-    protected function processObsoleteEntry($data)
-    {
-        $this->currentEntry['obsolete'] = true;
-
-        $tmpParts = explode(' ', $data);
-        $tmpKey = $tmpParts[0];
-        $str = implode(' ', array_slice($tmpParts, 1));
-
-        switch ($tmpKey) {
-            case 'msgid':
-                $this->currentEntry['msgid'] = trim($str, '"');
-                break;
-            case 'msgstr':
-                $this->currentEntry['msgstr'][] = trim($str, '"');
-                break;
-            default:
-                break;
-        }
-    }
 
     /**
      * @param $value
      */
-    protected function addEntryData($value)
+    protected function addEntryData($value, $pluralIndex = 0)
     {
         if ($this->state === 'msgstr') {
-            $this->currentEntry[$this->state][] = $value;
+            $this->currentEntry[$this->state][$pluralIndex][] = $value;
         } else {
             $this->currentEntry[$this->state] = $value;
         }
@@ -408,11 +402,11 @@ class Parser
     {
         $headers = array();
 
-        if (!is_array($entry['msgstr'])) {
+        if (!is_array($entry['msgstr']) || !is_array($entry['msgstr'][0])) {
             return $headers;
         }
 
-        foreach ($entry['msgstr'] as $headerRaw) {
+        foreach ($entry['msgstr'][0] as $headerRaw) {
             $parts = explode(':', $headerRaw);
             if (count($parts) < 2) {
                 continue;
@@ -439,68 +433,22 @@ class Parser
     }
 
     /**
-     * Helper for the update-functions by deleting the fuzzy flag
+     * Allows modification a msgid.
+     * By default disabled fuzzy flag if defined.
      *
-     * @param $msgid string msgid of entry
-     *
-     * @throws \Exception
+     * @param $original
+     * @param $translation
      */
-    protected function removeFuzzyFlagForMsgId($msgid)
+    public function updateEntry($original, $translation)
     {
-        if (!isset($this->entriesAsArrays[$msgid])) {
-            throw new \Exception('Entry does not exist');
-        }
-        if ($this->entriesAsArrays[$msgid]['fuzzy']) {
-            $flags = $this->entriesAsArrays[$msgid]['flags'];
-            unset($flags[array_search('fuzzy', $flags, true)]);
-            $this->entriesAsArrays[$msgid]['flags'] = $flags;
-            $this->entriesAsArrays[$msgid]['fuzzy'] = false;
-        }
+        $this->entriesAsArrays[$original]['fuzzy'] = false;
+        $this->entriesAsArrays[$original]['msgstr'] = array($translation);
+
+        $flags = $this->entriesAsArrays[$original]['flags'];
+        unset($flags[array_search('fuzzy', $flags, true)]);
+        $this->entriesAsArrays[$original]['flags'] = $flags;
     }
 
-    /**
-     * Allows modification of all translations of an entry
-     *
-     * @param $msgid string msgid of the entry which should be updated
-     * @param $translation array of strings new Translation for all msgstr by msgid
-     *
-     * @throws \Exception
-     */
-    public function updateEntries($msgid, $translation)
-    {
-        if (
-            !isset($this->entriesAsArrays[$msgid])
-            || !is_array($translation)
-            || sizeof($translation) != sizeof($this->entriesAsArrays[$msgid]['msgstr'])
-        ) {
-            throw new \Exception('Cannot update entry translation');
-        }
-        $this->removeFuzzyFlagForMsgId($msgid);
-        $this->entriesAsArrays[$msgid]['msgstr'] = $translation;
-    }
-
-    /**
-     * Allows modification of a single translation of an entry
-     *
-     * @param $msgid string msgid of the entry which should be updated
-     * @param $translation string new translation for an msgstr by msgid
-     * @param $positionMsgstr integer spezification which of the msgstr
-     *      should be changed
-     *
-     * @throws \Exception
-     */
-    public function updateEntry($msgid, $translation, $positionMsgstr = 0)
-    {
-        if (
-            !isset($this->entriesAsArrays[$msgid])
-            || !is_string($translation)
-            || !isset($this->entriesAsArrays[$msgid]['msgstr'][$positionMsgstr])
-        ) {
-            throw new \Exception('Cannot update entry translation');
-        }
-        $this->removeFuzzyFlagForMsgId($msgid);
-        $this->entriesAsArrays[$msgid]['msgstr'][$positionMsgstr] = $translation;
-    }
 
     /**
      * Write entries into the po file.
